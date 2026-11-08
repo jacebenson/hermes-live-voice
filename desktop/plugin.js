@@ -92,6 +92,7 @@ const SB = 'var(--popover-surface, #ffffff)'
 const bus = {
   live: false, stage: 'idle', micLevel: 0, remoteLevel: 0, widget: false, err: '', muted: false,
   bands: [0, 0, 0, 0, 0, 0], remBands: [0, 0, 0, 0, 0, 0], transcriptRev: 0, spkUser: false, spkBot: false, botName: '',
+  parkIdle: 0, parkPref: 0,
   emit() {
     try {
       window.dispatchEvent(new CustomEvent('talk-desktop:state', { detail: {
@@ -806,11 +807,15 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
   let lastVoiceAt = Date.now()
   const parkTimer = setInterval(() => {
     const pref = idlePrefSec(ctx) * 1000
+    bus.parkPref = pref ? Math.round(pref / 1000) : 0
     if (!pref) return
-    if (!bus.live || bus.stage !== 'connected') return
-    if (_delegBusy) { lastVoiceAt = Date.now(); return }
-    const active = bus.spkUser || bus.spkBot || (bus.micLevel || 0) > 0.03 || (bus.remoteLevel || 0) > 0.03
-    if (active) { lastVoiceAt = Date.now(); return }
+    if (!bus.live || bus.stage !== 'connected') { bus.parkIdle = 0; return }
+    if (_delegBusy) { lastVoiceAt = Date.now(); bus.parkIdle = 0; return }
+    // ambient noise sits well above 0.03 with the mic gain applied; require
+    // either an explicit speech event or a clearly loud frame
+    const active = bus.spkUser || bus.spkBot || (bus.micLevel || 0) > 0.09 || (bus.remoteLevel || 0) > 0.09
+    bus.parkIdle = Math.round((Date.now() - lastVoiceAt) / 1000)
+    if (active) { lastVoiceAt = Date.now(); bus.parkIdle = 0; return }
     if (Date.now() - lastVoiceAt < pref) return
     try { ctl.close() } catch {}
     try { parkSession(ctx) } catch {}
@@ -1695,7 +1700,8 @@ function LivePanel() {
   const s = useLiveState()
   const stop = () => { try { window.__talkLiveHandle?.close() } catch {} }
   const dot = s.err ? '#dc2626' : (s.stage === 'connected' ? '#22c55e' : '#f59e0b')
-  const status = s.err ? tr('error', 'error') : (s.spkBot ? tr('hablando', 'speaking') : (s.spkUser ? tr('te escucho', 'listening') : (s.stage === 'connected' ? tr('en vivo', 'live') : s.stage)))
+  const parkTxt = (bus.parkPref && bus.live) ? ' · ' + Math.round(bus.parkIdle || 0) + 's/' + bus.parkPref + 's' : ''
+  const status = (s.err ? tr('error', 'error') : (s.spkBot ? tr('hablando', 'speaking') : (s.spkUser ? tr('te escucho', 'listening') : (s.stage === 'connected' ? tr('en vivo', 'live') : s.stage)))) + parkTxt
   return jsxs('div', { style: { display: 'flex', flexDirection: 'column' }, children: [
     jsxs('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 14px 6px' }, children: [
       jsxs('div', { style: { display: 'flex', alignItems: 'center', minWidth: 0 }, children: [
