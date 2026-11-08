@@ -792,12 +792,28 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
   }
   const meterLoop = makeLoop(tick, 24)
 
+  // Auto-park: close this session after `idle.v1` seconds with no voice in
+  // either direction, then reopen on speech. Never while a task is running.
+  let lastVoiceAt = Date.now()
+  const parkTimer = setInterval(() => {
+    const pref = idlePrefSec(ctx) * 1000
+    if (!pref) return
+    if (!bus.live || bus.stage !== 'connected') return
+    if (_delegBusy) { lastVoiceAt = Date.now(); return }
+    const active = bus.spkUser || bus.spkBot || (bus.micLevel || 0) > 0.03 || (bus.remoteLevel || 0) > 0.03
+    if (active) { lastVoiceAt = Date.now(); return }
+    if (Date.now() - lastVoiceAt < pref) return
+    try { ctl.close() } catch {}
+    try { parkSession(ctx) } catch {}
+  }, 1000)
+
   ctl.close = () => {
     if (closed) return
     closed = true
     if (bus.stage === 'connected') playChime('hangup')
     try { clearInterval(statsTimer) } catch {}
     try { clearInterval(idleTimer) } catch {}
+    try { clearInterval(parkTimer) } catch {}
     try { for (let i = 0; i < transcript.length; i++) transcript[i].done = true } catch {}
     try { disposeLoop(meterLoop) } catch {}
     try {
@@ -821,6 +837,73 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
     toggleMute: () => { try { return ctl.toggleMute() } catch {} return false }
   }
 }
+
+// ── auto-park ────────────────────────────────────────────────────────────────
+// A live Codex call stays connected while nobody is talking, and the plan's
+// voice minutes run the whole time. Park the session after a configurable
+// silence, keep only a local mic probe running, and reopen the call on speech.
+// Off by default: this changes call behaviour, so it is opt-in until tested.
+
+const KEY_IDLE = 'idle.v1'
+const IDLE_OFF = 0
+const idlePrefSec = ctx => {
+  try { const v = Number(ctx.storage.get(KEY_IDLE) || 0); return Number.isFinite(v) && v > 0 ? v : 0 } catch { return 0 }
+}
+
+let _parkProbe = null
+let _parkResumeAt = 0
+
+function _vadStop() {
+  const p = _parkProbe
+  _parkProbe = null
+  if (!p) return
+  try { clearInterval(p.loop) } catch {}
+  try { p.stream.getTracks().forEach(t => t.stop()) } catch {}
+  try { p.ctx.close() } catch {}
+}
+
+// Resolve 'speech' when the local mic hears sustained voice, 'timeout' after
+// `maxMs`. Local RMS only: no transcript, no upload, no tokens spent.
+async function _vadWaitForSpeech(maxMs, onLevel) {
+  let stream = null, ac = null
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+    ac = new (window.AudioContext || window.webkitAudioContext)()
+    const src = ac.createMediaStreamSource(stream)
+    const an = ac.createAnalyser(); an.fftSize = 512; src.connect(an)
+    const buf = new Uint8Array(an.fftSize)
+    let hits = 0
+    const started = Date.now()
+    return await new Promise(resolve => {
+      const loop = setInterval(() => {
+        try { an.getByteTimeDomainData(buf) } catch {}
+        let sum = 0
+        for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
+        const rms = Math.sqrt(sum / buf.length)
+        if (typeof onLevel === 'function') { try { onLevel(rms) } catch {} }
+        hits = rms > 0.045 ? hits + 1 : Math.max(0, hits - 1)   // 3 ticks = ~300ms of voice
+        if (hits >= 3) { _parkProbe = null; clearInterval(loop); resolve('speech'); return }
+        if (Date.now() - started > maxMs) { _parkProbe = null; clearInterval(loop); resolve('timeout') }
+      }, 100)
+      _parkProbe = { loop, stream, ctx: ac }
+    })
+  } catch (e) {
+    _vadStop()
+    return 'error'
+  }
+}
+
+async function parkSession(ctx) {
+  _parkResumeAt = Date.now()
+  bus.set({ stage: 'parked', live: false, micLevel: 0, remoteLevel: 0 })
+  const why = await _vadWaitForSpeech(15 * 60 * 1000)
+  if (why === 'speech') {
+    try { window.__talkResumeLive && window.__talkResumeLive() } catch {}
+  } else {
+    bus.set({ stage: 'idle' })
+  }
+}
+if (typeof window !== 'undefined') { window.__talkParkProbe = () => !!_parkProbe }
 
 function useLiveState() {
   const [s, setS] = useState(() => ({ live: bus.live, stage: bus.stage, micLevel: bus.micLevel, remoteLevel: bus.remoteLevel, widget: bus.widget, err: bus.err, transcriptRev: bus.transcriptRev, spkUser: bus.spkUser, spkBot: bus.spkBot, muted: bus.muted }))
@@ -1085,6 +1168,7 @@ function ConfigForm({ ctx, dense = false }) {
   const [micTest, setMicTest] = useState({ on: false, err: '' })
   const [pvVoice, setPvVoice] = useState({ state: 'idle', voice: '' })
   const [adv, setAdv] = useState(false)
+  const [idlePref, setIdlePref] = useState(() => idlePrefSec(ctx))
   const [outTest, setOutTest] = useState({ state: 'idle', err: '' })
   const micBarRef = useRef(null)
   const micTestRef = useRef(null)
@@ -1116,6 +1200,7 @@ function ConfigForm({ ctx, dense = false }) {
   useEffect(() => { ctx.storage.set(KEY_OUT, outId) }, [outId])
   useEffect(() => { ctx.storage.set(KEY_CHAT, chatWork ? '1' : '0') }, [chatWork])
   useEffect(() => { ctx.storage.set(KEY_ENGINE, engine) }, [engine])
+  useEffect(() => { ctx.storage.set(KEY_IDLE, String(idlePref)) }, [idlePref])
   const runPreview = async () => {
     if (bus.live) { try { sdk.host && sdk.host.notifyError && sdk.host.notifyError(tr('Colgá la llamada activa antes de probar voces.', 'Hang up the active call before testing voices.'), 'Live Voice') } catch {} return }
     if (pvVoice.state === 'load') return
@@ -1282,6 +1367,18 @@ function ConfigForm({ ctx, dense = false }) {
         jsxs(SelectContent, { children: [
           jsx(SelectItem, { value: 'codex', children: opt(tr('Codex (suscripción)', 'Codex (subscription)')) }),
           jsx(SelectItem, { value: 'hermes', children: opt(tr('Hermes (realtime)', 'Hermes (realtime)')) })
+        ] })
+      ] })
+    ] }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Reposo', 'Auto-park') }),
+      jsxs(Select, { value: String(idlePref), onValueChange: v => setIdlePref(Number(v) || 0), children: [
+        jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
+        jsxs(SelectContent, { children: [
+          jsx(SelectItem, { value: '0', children: tr('Desactivado', 'Off') }),
+          jsx(SelectItem, { value: '30', children: '30 s' }),
+          jsx(SelectItem, { value: '60', children: '1 min' }),
+          jsx(SelectItem, { value: '120', children: '2 min' })
         ] })
       ] })
     ] }),
@@ -1700,6 +1797,13 @@ function ComposerLiveButton({ ctx }) {
   }
 
   const live = s.live && s.stage === 'connected'
+  // auto-park reopens through this, so it uses the current voice/mic/engine
+  const toggleRef = useRef(toggle)
+  toggleRef.current = toggle
+  useEffect(() => {
+    window.__talkResumeLive = () => { try { if (!bus.live) toggleRef.current() } catch {} }
+    return () => { try { delete window.__talkResumeLive } catch {} }
+  }, [])
   useEffect(() => { if (!s.live && showTr) setShowTr(false) }, [s.live, showTr])
   const connecting = busy || (s.live && s.stage !== 'connected' && s.stage !== 'error' && s.stage !== 'failed')
   const cs = 'var(--composer-control-size, 30px)'
