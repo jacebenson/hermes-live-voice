@@ -30,6 +30,37 @@ const effVoiceFor = (engine, stored) => {
   if (engine === 'codex') return V3_VOICES.indexOf(v) >= 0 ? v : 'cove'
   return VOICES.indexOf(v) >= 0 ? v : 'marin'
 }
+// Voice choice is kept per engine: the two engines have disjoint voice
+// vocabularies, so one shared key silently reset the Codex voice whenever the
+// engine switched (including the automatic quota fallback to 'hermes').
+const KEY_VOICES = 'voices.v1'
+const voiceDefaultFor = engine => (engine === 'codex' ? 'cove' : 'marin')
+const voiceSetFor = engine => (engine === 'codex' ? V3_VOICES : VOICES)
+const readVoiceMap = ctx => {
+  const raw = ctx.storage.get(KEY_VOICES)
+  if (raw) {
+    try {
+      const m = JSON.parse(raw)
+      if (m && typeof m === 'object' && !Array.isArray(m)) return m
+    } catch {}
+  }
+  // Migrate the legacy single-value key into the engine whose vocabulary holds it.
+  const legacy = String(ctx.storage.get(KEY_VOICE) || '')
+  const seed = {}
+  if (V3_VOICES.indexOf(legacy) >= 0) seed.codex = legacy
+  if (VOICES.indexOf(legacy) >= 0) seed.hermes = legacy
+  return seed
+}
+const readVoiceFor = (ctx, engine) => {
+  const v = readVoiceMap(ctx)[engine]
+  return voiceSetFor(engine).indexOf(v) >= 0 ? v : voiceDefaultFor(engine)
+}
+const writeVoiceFor = (ctx, engine, voice) => {
+  if (voiceSetFor(engine).indexOf(voice) < 0) return   // never store a voice this engine cannot speak
+  const m = readVoiceMap(ctx)
+  m[engine] = voice
+  try { ctx.storage.set(KEY_VOICES, JSON.stringify(m)) } catch {}
+}
 const SENTINEL_DEFAULT = '__default'
 const SENTINEL_HOST = '__host'
 const EN = String((typeof navigator !== 'undefined' && navigator.language) || 'en').toLowerCase().indexOf('en') === 0
@@ -70,7 +101,35 @@ const bus = {
       } }))
     } catch {}
   },
-  set(patch) { Object.assign(this, patch); this.emit() }
+  set(patch) { Object.assign(this, patch); this.emit(); trackStage(patch) }
+}
+
+// ── diagnóstico de cortes ────────────────────────────────────────────────────
+// A dropped call leaves no server-side trace: the SDP session just stops. Keep
+// a small ring buffer in the page so the next disconnect can be explained from
+// the client's own view (stage transition, page visibility, wake lock, WebRTC
+// connection state) instead of guessed at. Read it in the console with
+// __talkDiag() right after a drop.
+
+const DIAG = []
+function trackStage(patch) {
+  try {
+    if (!('stage' in patch) && !('live' in patch) && !('err' in patch)) return
+    DIAG.push({
+      t: new Date().toISOString(),
+      stage: bus.stage,
+      live: bus.live,
+      err: (bus.err || '').slice(0, 200),
+      vis: (typeof document !== 'undefined' ? document.visibilityState : '?'),
+      awake: !!(_wakeSentinel && !_wakeSentinel.released),
+      pc: (() => { try { return (_liveRefs && _liveRefs.pc && _liveRefs.pc.connectionState) || 'none' } catch { return '' } })(),
+      net: (navigator && navigator.onLine === false) ? 'offline' : 'online',
+    })
+    if (DIAG.length > 60) DIAG.shift()
+  } catch {}
+}
+if (typeof window !== 'undefined') {
+  window.__talkDiag = () => JSON.parse(JSON.stringify(DIAG))
 }
 
 // ── transcripción de la sesión (compartida por widget y pane) ────────────────
@@ -564,18 +623,37 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
   let audioEl = null
   pc.ontrack = ev => {
     log('audio del bot conectado')
-    const remoteStream = ev.streams[0]
-    audioEl = new Audio()
+    // The realtime backend often delivers the remote track with an EMPTY
+    // streams[] array, so ev.streams[0] is undefined and the element plays
+    // silence. Fall back to a MediaStream built from the track itself.
+    const remoteStream = (ev.streams && ev.streams[0]) || new MediaStream([ev.track])
+    if (!audioEl) {
+      audioEl = new Audio()
+      audioEl.autoplay = true
+      audioEl.playsInline = true
+      try { audioEl.setAttribute('playsinline', '') } catch {}
+      audioEl.style.display = 'none'
+      // A detached element can be throttled; keep it in the document.
+      try { document.body.appendChild(audioEl) } catch {}
+      if (_liveRefs) _liveRefs.audioEl = audioEl
+    }
     audioEl.srcObject = remoteStream
-    audioEl.autoplay = true
-    audioEl.play().catch(() => log('click para reproducir audio'))
-  if (_liveRefs) _liveRefs.audioEl = audioEl
-    if (outId && audioEl.setSinkId) audioEl.setSinkId(outId).catch(e => log('salida: ' + e.message))
-    const an = audioCtx.createAnalyser(); an.fftSize = 256
-    const src = audioCtx.createMediaStreamSource(remoteStream)
-    const mute = audioCtx.createGain(); mute.gain.value = 0
-    src.connect(an); an.connect(mute); mute.connect(audioCtx.destination)
-    remoteRef.an = an
+    audioEl.play().catch(err => {
+      log('audio bloqueado: ' + ((err && err.message) || err))
+      pushTranscript('sys', tr('Toca para activar el audio', 'Tap to enable audio'))
+    })
+    // setSinkId needs the speaker-selection permission in a browser and can
+    // reject; an unsupported output id must not break playback.
+    if (outId && typeof audioEl.setSinkId === 'function') {
+      audioEl.setSinkId(outId).catch(e => log('salida: ' + e.message))
+    }
+    try {
+      const an = audioCtx.createAnalyser(); an.fftSize = 256
+      const src = audioCtx.createMediaStreamSource(remoteStream)
+      const mute = audioCtx.createGain(); mute.gain.value = 0
+      src.connect(an); an.connect(mute); mute.connect(audioCtx.destination)
+      remoteRef.an = an
+    } catch (e) { log('analyser: ' + ((e && e.message) || e)) }
   }
 
   let closed = false
@@ -752,6 +830,47 @@ function useLiveState() {
     return () => window.removeEventListener('talk-desktop:state', h)
   }, [])
   return s
+}
+
+// ── pantalla encendida mientras hay llamada ──────────────────────────────────
+// Android/iOS suspend the tab when the screen sleeps, which kills the mic even
+// though the WebRTC session is still up. The Screen Wake Lock API is the only
+// supported way to hold the display on from a page; it needs a secure context
+// and the document to be visible, so re-acquire on every visibilitychange.
+
+let _wakeSentinel = null
+let _wakeWanted = false
+let _wakeGen = 0
+
+async function keepScreenAwake(on) {
+  const gen = ++_wakeGen
+  _wakeWanted = !!on
+  if (typeof navigator === 'undefined' || !navigator.wakeLock || !navigator.wakeLock.request) return
+  if (!on) {
+    try { _wakeSentinel && _wakeSentinel.release() } catch {}
+    _wakeSentinel = null
+    return
+  }
+  if (_wakeSentinel && !_wakeSentinel.released) return
+  try {
+    const s = await navigator.wakeLock.request('screen')
+    // A late answer to a superseded request (hung up, or a newer request won)
+    // must release rather than park a lock nothing will ever clear.
+    if (gen !== _wakeGen || !_wakeWanted) {
+      try { s.release() } catch {}
+      return
+    }
+    _wakeSentinel = s
+    s.addEventListener('release', () => { _wakeSentinel = null })
+  } catch (e) {
+    _wakeSentinel = null
+  }
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (_wakeWanted && document.visibilityState === 'visible') keepScreenAwake(true)
+  })
 }
 
 // ── onda viva: barras por loop JS, reactivas a voz real ──────────────────────
@@ -957,7 +1076,7 @@ async function _pvGenerate(ctx, { engine, voice, profile, micId, outId }) {
 // ── formulario de configuración (Popover / widget / pane comparten esto) ────
 
 function ConfigForm({ ctx, dense = false }) {
-  const [voice, setVoice] = useState(() => ctx.storage.get(KEY_VOICE) || 'marin')
+  const [voice, setVoice] = useState(() => readVoiceFor(ctx, ctx.storage.get(KEY_ENGINE) || 'codex'))
   const [profile, setProfile] = useState(() => ctx.storage.get(KEY_PROFILE) || '')
   const [micId, setMicId] = useState(() => ctx.storage.get(KEY_MIC) || '')
   const [outId, setOutId] = useState(() => ctx.storage.get(KEY_OUT) || '')
@@ -965,6 +1084,8 @@ function ConfigForm({ ctx, dense = false }) {
   const [engine, setEngine] = useState(() => ctx.storage.get(KEY_ENGINE) || 'codex')
   const [micTest, setMicTest] = useState({ on: false, err: '' })
   const [pvVoice, setPvVoice] = useState({ state: 'idle', voice: '' })
+  const [adv, setAdv] = useState(false)
+  const [outTest, setOutTest] = useState({ state: 'idle', err: '' })
   const micBarRef = useRef(null)
   const micTestRef = useRef(null)
   const focusedProf = useValue(sdk.host.state.focusedSessionProfile)
@@ -981,7 +1102,15 @@ function ConfigForm({ ctx, dense = false }) {
       .then(list => setDevs({ mics: list.filter(d => d.kind === 'audioinput'), outs: list.filter(d => d.kind === 'audiooutput') }))
       .catch(() => {})
   }, [])
-  useEffect(() => { ctx.storage.set(KEY_VOICE, voice) }, [voice])
+  useEffect(() => { writeVoiceFor(ctx, engine, voice) }, [voice, engine])
+  const prevEngineRef = useRef(null)
+  useEffect(() => {
+    // Switching engines must load that engine's own saved voice, never coerce
+    // the other engine's voice to its default and persist that over it.
+    const prev = prevEngineRef.current
+    prevEngineRef.current = engine
+    if (prev && prev !== engine) setVoice(readVoiceFor(ctx, engine))
+  }, [engine])
   useEffect(() => { ctx.storage.set(KEY_PROFILE, profile) }, [profile])
   useEffect(() => { ctx.storage.set(KEY_MIC, micId) }, [micId])
   useEffect(() => { ctx.storage.set(KEY_OUT, outId) }, [outId])
@@ -1013,13 +1142,53 @@ function ConfigForm({ ctx, dense = false }) {
   useEffect(() => { setProfile('') }, [String(focusedProf || '')])
   useEffect(() => () => { try { stopMicTest() } catch {} }, [])
 
-  const field = { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: dense ? 6 : 8 }
   const label = { fontSize: 10.5, fontWeight: 600, color: 'var(--ui-text-tertiary, #71717a)', textTransform: 'uppercase', letterSpacing: '0.05em' }
+  const field = { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: dense ? 4 : 6 }
+  const row = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }
+  const rowLabel = { ...label, width: 76, flexShrink: 0, marginBottom: 0 }
   const trigStyle = { width: '100%', minWidth: 0, overflow: 'hidden' }
   const valStyle = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block', flex: '1 1 auto', minWidth: 0 }
   const opt = text => jsx('span', { title: text, style: { display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 232 }, children: text })
 
   const pick = (next, set) => v => { set(v === SENTINEL_DEFAULT ? '' : v) }
+
+  // Output test: a short generated tone through the selected device. WebAudio
+  // cannot target a sink, so the tone is a small WAV blob played by an <audio>
+  // element and routed with setSinkId when a device is selected.
+  const playOutputTest = () => {
+    try {
+      const sr = 44100, dur = 0.55, n = Math.floor(sr * dur)
+      const buf = new ArrayBuffer(44 + n * 2)
+      const v = new DataView(buf)
+      const wr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)) }
+      wr(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); wr(8, 'WAVE'); wr(12, 'fmt ')
+      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true)
+      v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true)
+      wr(36, 'data'); v.setUint32(40, n * 2, true)
+      for (let i = 0; i < n; i++) {
+        const t = i / sr
+        const f = t < 0.24 ? 880 : 659.25          // two soft notes, not one loud beep
+        const env = Math.min(1, t / 0.02) * Math.max(0, Math.min(1, (dur - t) / 0.14))
+        v.setInt16(44 + i * 2, Math.sin(2 * Math.PI * f * t) * 0.12 * env * 32767, true)
+      }
+      const el = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })))
+      el.volume = 1
+      try { document.body.appendChild(el) } catch {}
+      el.style.display = 'none'
+      const blocked = e => setOutTest({ state: 'err', err: tr('Salida bloqueada: ', 'Output blocked: ') + ((e && e.message) || e) })
+      const go = () => el.play().then(() => setOutTest({ state: 'play', err: '' })).catch(blocked)
+      el.onended = () => setOutTest({ state: 'idle', err: '' })
+      setOutTest({ state: 'play', err: '' })
+      if (outId && typeof el.setSinkId === 'function') {
+        el.setSinkId(outId).then(go).catch(e => {
+          setOutTest({ state: 'err', err: tr('Salida no disponible: ', 'Output unavailable: ') + ((e && e.message) || e) })
+          go()
+        })
+      } else go()
+    } catch (e) {
+      setOutTest({ state: 'err', err: tr('No se pudo probar la salida: ', 'Could not test output: ') + ((e && e.message) || e) })
+    }
+  }
 
   const stopMicTest = () => {
     const t = micTestRef.current
@@ -1064,16 +1233,39 @@ function ConfigForm({ ctx, dense = false }) {
     }
   }
 
-  return jsxs('div', { style: { display: 'flex', flexDirection: 'column', width: '100%' }, children: [
+  return jsxs('div', { style: { display: 'flex', flexDirection: 'column', width: '100%', maxHeight: 'min(70vh, 520px)', overflowY: 'auto', overscrollBehavior: 'contain' }, children: [
     jsxs('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }, children: [
       jsx('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--foreground, #18181b)' }, children: 'Live Voice' }),
       info && jsx('div', {
         style: { fontSize: 10.5, fontWeight: 600, color: info.error ? '#dc2626' : '#3b82f6' },
-        children: info.error ? tr('sin host', 'no host') : tr('conectado', 'connected')
+        children: info.error ? tr('sin host', 'host offline') : (engine === 'codex' ? 'Codex' : 'Hermes')
       })
     ] }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: 'Bot' }),
+    jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Voz', 'Voice') }),
+      jsxs(Select, { value: voiceSetFor(engine).indexOf(voice) >= 0 ? voice : voiceDefaultFor(engine), onValueChange: setVoice, children: [
+        jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
+        jsx(SelectContent, { children: (engine === 'codex' ? V3_VOICES : VOICES).map(v => jsx(SelectItem, { value: v, children: v.charAt(0).toUpperCase() + v.slice(1) }, v)) })
+      ] })
+    ] }),
+    jsxs('div', { style: row, children: [
+      jsx('div', { style: { ...rowLabel, lineHeight: 1.25 }, children: tr('Tareas', 'Tasks') }),
+      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }, children: [
+        jsx(Switch, { checked: chatWork, onCheckedChange: v => setChatWork(!!v) }),
+        jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)' }, children: chatWork ? tr('corren en el chat', 'runs in this chat') : tr('solo responde', 'answers only') })
+      ] })
+    ] }),
+    jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', lineHeight: 1.3, marginTop: -2, marginBottom: 8 }, children: chatWork
+      ? tr('La voz puede ejecutar tareas acá, con las tools y el modelo de este chat.', 'Voice can run tasks here, with this chat\'s tools and model.')
+      : tr('La voz solo conversa: no ejecuta nada.', 'Voice only talks: it runs nothing.') }),
+    jsx('button', {
+      type: 'button',
+      onClick: () => setAdv(v => !v),
+      style: { position: 'sticky', bottom: 0, zIndex: 1, alignSelf: 'stretch', margin: '0 0 4px', padding: '8px 0 6px', border: 0, borderTop: '1px solid rgba(127,127,127,0.28)', background: 'transparent', cursor: 'pointer', textAlign: 'left', fontSize: 11.5, fontWeight: 600, color: 'inherit', opacity: 0.85 },
+      children: (adv ? '▾ ' : '▸ ') + (adv ? tr('Menos ajustes', 'Fewer settings') : tr('Más ajustes', 'More settings'))
+    }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: 'Bot' }),
       jsxs(Select, { value: profile === '' ? '__auto' : profile, onValueChange: v => setProfile(v === '__auto' ? '' : v), children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
@@ -1083,84 +1275,58 @@ function ConfigForm({ ctx, dense = false }) {
         ] })
       ] })
     ] }),
-    jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', marginTop: -4, marginBottom: 8 }, children: profile === ''
-      ? (autoName
-        ? tr('sigue la ventana → ', 'follows window → ') + autoName + ' (Bot)'
-        : tr('Automático: usa el bot de la ventana activa (si no, el bot principal).', 'Auto: uses the current window bot (otherwise the main bot).'))
-      : tr('Fijo: ', 'Fixed: ') + (profile === '__host' ? tr('Bot principal (host)', 'Main bot (host)') : profile + ' (Bot)') }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: tr('Motor de voz', 'Voice engine') }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Motor', 'Engine') }),
       jsxs(Select, { value: engine, onValueChange: setEngine, children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
-          jsx(SelectItem, { value: 'codex', children: opt('Codex Live-1 (gpt-live-1)') }),
-          jsx(SelectItem, { value: 'hermes', children: opt('Hermes (gpt-realtime-2.1)') })
+          jsx(SelectItem, { value: 'codex', children: opt(tr('Codex (suscripción)', 'Codex (subscription)')) }),
+          jsx(SelectItem, { value: 'hermes', children: opt(tr('Hermes (realtime)', 'Hermes (realtime)')) })
         ] })
-      ] }),
-      jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', marginTop: -2, marginBottom: 2 }, children: engine === 'codex'
-        ? tr('Con tu suscripción de Codex — recomendado.', 'On your Codex subscription — recommended.')
-        : tr('realtime-2.1 (motor anterior).', 'realtime-2.1 (previous engine).') })
-    ] }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: tr('Voz', 'Voice') }),
-      jsxs(Select, { value: effVoiceFor(engine, voice), onValueChange: setVoice, children: [
-        jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
-        jsx(SelectContent, { children: (engine === 'codex' ? V3_VOICES : VOICES).map(v => jsx(SelectItem, { value: v, children: v }, v)) })
-      ] }),
-      jsxs('div', { style: { display: 'none', alignItems: 'center', gap: 8, marginTop: 6 }, children: [   // preview desactivado por ahora
-        jsx(Button, {
-          variant: 'secondary', size: 'sm', onClick: runPreview, style: { flexShrink: 0 },
-          children: [
-            pvVoice.state === 'load' ? jsx('span', { style: { position: 'relative', width: 11, height: 11, display: 'inline-block', marginRight: 6, verticalAlign: '-1px' }, children: jsx(SpinnerRing, { inset: 0 }) }) : null,
-            pvVoice.state === 'load' ? tr('Generando muestra…', 'Generating…') : (pvVoice.state === 'play' ? tr('Reproduciendo…', 'Playing…') : tr('▶ Probar voz', '▶ Test voice'))
-          ]
-        }),
-        jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', lineHeight: 1.3 }, children: pvVoice.state === 'load' ? tr('La voz está grabando su muestra…', 'The voice is recording its sample…') : tr('Escuchala antes de elegir (queda en caché).', 'Listen before choosing (cached).') })
       ] })
     ] }),
-    jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 10 }, children: [
-      jsx(Switch, { checked: chatWork, onCheckedChange: v => setChatWork(!!v) }),
-      jsxs('div', { style: { fontSize: 11.5, lineHeight: 1.3 }, children: [
-        tr('Trabajar en el chat', 'Work in the chat'),
-        jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)' }, children: tr('Las tareas se ejecutan en el chat abierto, con sus tools y su modelo (tu config de Hermes). La voz no ejecuta nada por su cuenta.', 'Tasks run in the open chat with its tools and model (your Hermes config). The voice never runs anything on its own.') }),
-      ] })
-    ] }),
-    jsx('div', { style: { ...label, marginTop: 6, marginBottom: 6, borderTop: '1px solid var(--ui-stroke-secondary, rgba(127,127,127,0.25))', paddingTop: 8 }, children: tr('Audio', 'Audio') }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: tr('Micrófono', 'Microphone') }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Micrófono', 'Mic') }),
       jsxs(Select, { value: micId || SENTINEL_DEFAULT, onValueChange: pick(micId, setMicId), children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
           jsx(SelectItem, { value: SENTINEL_DEFAULT, children: tr('Predeterminado del sistema', 'System default') }),
-          ...devs.mics.map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || (tr('Micrófono ', 'Microphone ') + (i + 1))) }, 'mic-' + i))
+          ...devs.mics.filter(d => !/^(default|predeterminado|comunicaciones|communications)\b/i.test(String(d.label || '').trim())).map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || (tr('Micrófono ', 'Microphone ') + (i + 1))) }, 'mic-' + i))
         ] })
       ] })
     ] }),
-    jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: -4, marginBottom: 10 }, children: [
-      jsx(Button, {
-        variant: micTest.on ? 'destructive' : 'secondary', size: 'sm',
-        onClick: toggleMicTest,
-        style: { flexShrink: 0 },
-        children: micTest.on ? tr('Detener', 'Stop') : tr('Probar', 'Test')
+    adv && jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }, children: [
+      jsx('button', {
+        type: 'button', onClick: toggleMicTest,
+        style: { flexShrink: 0, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.35)', background: micTest.on ? '#dc2626' : 'transparent', color: micTest.on ? '#fff' : 'inherit', fontSize: 10.5, cursor: 'pointer' },
+        children: micTest.on ? tr('Detener', 'Stop') : tr('Probar mic', 'Test mic')
       }),
-      jsx('div', { style: { flex: 1, height: 7, borderRadius: 4, background: 'rgba(127,127,127,0.22)', overflow: 'hidden' }, children:
+      jsx('div', { style: { flex: 1, height: 6, borderRadius: 4, background: 'rgba(127,127,127,0.22)', overflow: 'hidden' }, children:
         jsx('div', { ref: micBarRef, style: { height: '100%', width: '0%', background: micTest.err ? '#dc2626' : '#22c55e' } })
       })
     ] }),
-    micTest.on && !micTest.err && jsx('div', { style: { fontSize: 10, color: '#16a34a', marginTop: -6, marginBottom: 8 }, children: tr('Habla y mira la barra: si no se mueve, este micrófono no capta.', 'Speak and watch the bar: if it stays flat, this mic is not capturing.') }),
-    micTest.err && jsx('div', { style: { fontSize: 10.5, color: '#dc2626', marginTop: -6, marginBottom: 8, lineHeight: 1.4 }, children: micTest.err }),
-    jsxs('div', { style: { ...field, marginBottom: 4 }, children: [
-      jsx('div', { style: label, children: tr('Salida', 'Output') }),
+    micTest.on && !micTest.err && jsx('div', { style: { fontSize: 10, color: '#16a34a', marginTop: -2, marginBottom: 6 }, children: tr('Hablá: si la barra no se mueve, este mic no capta.', 'Speak: a flat bar means this mic is not capturing.') }),
+    micTest.err && jsx('div', { style: { fontSize: 10.5, color: '#dc2626', marginTop: -2, marginBottom: 6, lineHeight: 1.4 }, children: micTest.err }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Salida', 'Output') }),
       jsxs(Select, { value: outId || SENTINEL_DEFAULT, onValueChange: pick(outId, setOutId), children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
           jsx(SelectItem, { value: SENTINEL_DEFAULT, children: tr('Predeterminado del sistema', 'System default') }),
-          ...devs.outs.map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || ('Salida ' + (i + 1))) }, 'out-' + i))
+          ...devs.outs.filter(d => !/^(default|predeterminado|comunicaciones|communications)\b/i.test(String(d.label || '').trim())).map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || ('Salida ' + (i + 1))) }, 'out-' + i))
         ] })
       ] })
     ] }),
+    adv && jsx('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }, children: [
+      jsx('button', {
+        type: 'button', onClick: playOutputTest,
+        style: { flexShrink: 0, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.35)', background: 'transparent', color: 'inherit', fontSize: 10.5, cursor: 'pointer' },
+        children: outTest.state === 'play' ? tr('Sonando…', 'Playing…') : tr('Probar salida', 'Test output')
+      })
+    ] }),
+    outTest.err && jsx('div', { style: { fontSize: 10.5, color: '#dc2626', marginTop: -2, marginBottom: 6, lineHeight: 1.4 }, children: outTest.err }),
     devs.mics.length === 0 && jsx('div', { style: { fontSize: 10.5, color: 'var(--ui-text-tertiary, #a1a1aa)', lineHeight: 1.4 }, children: tr('Los dispositivos aparecen tras conceder el micrófono la primera vez.', 'Devices appear after granting the microphone the first time.') }),
-    jsx('div', { style: { borderTop: '1px solid var(--ui-stroke-secondary, rgba(127,127,127,0.25))', marginTop: 6, paddingTop: 8 }, children: jsx(CodexSection, { ctx }) })
+    adv && jsx('div', { style: { borderTop: '1px solid var(--ui-stroke-secondary, rgba(127,127,127,0.25))', marginTop: 6, paddingTop: 8 }, children: jsx(CodexSection, { ctx }) })
   ] })
 }
 
@@ -1443,6 +1609,9 @@ function LivePanel() {
 
 function ComposerLiveButton({ ctx }) {
   const s = useLiveState()
+  // Hold the screen on for the duration of a call: on Android the tab is
+  // suspended when the display sleeps, which drops the mic mid-conversation.
+  useEffect(() => { keepScreenAwake(!!s.live) }, [s.live])
   const [busy, setBusy] = useState(false)
   const [cfg, setCfg] = useState(false)
   const [micHover, setMicHover] = useState(false)
@@ -1451,7 +1620,7 @@ function ComposerLiveButton({ ctx }) {
   const [trHover, setTrHover] = useState(false)
   const [showTr, setShowTr] = useState(false)
   const [profile, setProfile] = useState(() => ctx.storage.get(KEY_PROFILE) || '')
-  const [voice, setVoice] = useState(() => ctx.storage.get(KEY_VOICE) || 'marin')
+  const [voice, setVoice] = useState(() => readVoiceFor(ctx, ctx.storage.get(KEY_ENGINE) || 'codex'))
   const [micId, setMicId] = useState(() => ctx.storage.get(KEY_MIC) || '')
   const [outId, setOutId] = useState(() => ctx.storage.get(KEY_OUT) || '')
   const btnRef = useRef(null)
@@ -1477,7 +1646,7 @@ function ComposerLiveButton({ ctx }) {
   useEffect(() => {
     const t = setInterval(() => {
       const p = ctx.storage.get(KEY_PROFILE) || ''
-      const v = ctx.storage.get(KEY_VOICE) || 'marin'
+      const v = readVoiceFor(ctx, ctx.storage.get(KEY_ENGINE) || 'codex')
       const mi = ctx.storage.get(KEY_MIC) || ''
       const o = ctx.storage.get(KEY_OUT) || ''
       setProfile(prev => (prev === p ? prev : p))
@@ -1508,7 +1677,7 @@ function ComposerLiveButton({ ctx }) {
     try { window.__talkLiveHandle?.close() } catch {}
     const effProfile = profile === '__host' ? '' : (profile || autoBot())
     const eng = ctx.storage.get(KEY_ENGINE) || 'codex'
-    const vv = effVoiceFor(eng, ctx.storage.get(KEY_VOICE) || '')
+    const vv = readVoiceFor(ctx, eng)
     setBusy(true)
     try {
       window.__talkLiveHandle = await startLive(ctx, { profile: effProfile, voice: vv, micId, outId, engine: eng, log: () => {} })
