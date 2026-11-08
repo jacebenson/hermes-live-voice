@@ -627,6 +627,7 @@ if router is not None:
 
     # ── uso de Live Voice (metrado local por sesión) ──────────────────────────
     _VU_FILE = _PLUGIN_ROOT / "data" / "voice-usage.json"
+    _VE_FILE = _PLUGIN_ROOT / "data" / "voice-events.jsonl"
     _VU_LOCK = threading.Lock()
 
     def _vu_load() -> dict:
@@ -663,6 +664,31 @@ if router is not None:
             keep = [s for s in sess if isinstance(s, dict) and int(s.get("t") or 0) > now_ms - 8 * 24 * 3600 * 1000]
             data["sessions"] = keep[-2000:]
             _vu_save(data)
+        return {"ok": True}
+
+    @router.post("/voice/event")
+    async def voice_event(request: Request) -> dict:
+        """Append one lifecycle event so a parked/resumed call can be diagnosed
+        server-side instead of only from the page's own console."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        kind = str((body or {}).get("kind") or "")[:40]
+        detail = str((body or {}).get("detail") or "")[:300]
+        if not kind:
+            return {"ok": False, "error": "kind requerido"}
+        rec = {"t": int(time.time() * 1000), "kind": kind, "detail": detail,
+               "vis": str((body or {}).get("vis") or "")[:20]}
+        with _VU_LOCK:
+            try:
+                _VU_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with _VE_FILE.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec) + "\n")
+                lines = _VE_FILE.read_text(encoding="utf-8").splitlines()[-600:]
+                _VE_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": str(exc)[:120]}
         return {"ok": True}
 
     @router.get("/voice/usage")

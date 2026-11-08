@@ -346,6 +346,7 @@ function _delegRespond(dc, itemId, text) {
     // The call is parked or gone: keep the result and wake the call to speak it.
     _pendingSpeak = body
     pushTranscript('sys', tr('respuesta lista, despertando la llamada', 'result ready, waking the call'))
+    _logEvent('result-ready', 'len=' + body.length)
     _wakeForPending()
     return
   }
@@ -355,6 +356,7 @@ function _delegRespond(dc, itemId, text) {
   } catch {
     _pendingSpeak = body
     pushTranscript('sys', tr('respuesta lista, despertando la llamada', 'result ready, waking the call'))
+    _logEvent('result-ready', 'after-send-fail len=' + body.length)
     _wakeForPending()
   }
 }
@@ -567,6 +569,8 @@ async function mintSession(ctx, profile, voice, allowChat) {
 }
 
 async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
+  _evtCtx = ctx
+  _logEvent('session-start', (engine || 'codex') + ' ' + (voice || ''))
   const eng = engine || 'codex'
   clearTranscript()
   liveAudioMs = 0
@@ -892,6 +896,21 @@ let _parkProbe = null
 let _parkResumeAt = 0
 let _parkThreadId = ''
 let _pendingSpeak = ''
+let _evtCtx = null
+
+// Lifecycle events go to the plugin backend so a parked/resumed call can be
+// diagnosed from the server log instead of the user's screen.
+function _logEvent(kind, detail) {
+  try {
+    const ctx = _evtCtx
+    if (!ctx || typeof ctx.rest !== 'function') return
+    ctx.rest('/voice/event', {
+      method: 'POST',
+      body: { kind: String(kind).slice(0, 40), detail: String(detail || '').slice(0, 300), vis: (typeof document !== 'undefined' ? document.visibilityState : '') },
+      timeoutMs: 4000,
+    }).catch(() => {})
+  } catch {}
+}
 
 function _vadStop() {
   const p = _parkProbe
@@ -937,20 +956,24 @@ function _wakeForPending(attempt) {
   const n = attempt || 0
   const go = typeof window !== 'undefined' ? window.__talkResumeLive : null
   if (typeof go === 'function') {
+    _logEvent('wake', 'attempt=' + n)
     try { go() } catch (e) { pushTranscript('sys', tr('no se pudo reabrir: ', 'could not reopen: ') + String((e && e.message) || e).slice(0, 120)) }
     return
   }
   if (n < 5) { setTimeout(() => _wakeForPending(n + 1), 800); return }
   pushTranscript('sys', tr('no hay gancho para reabrir la llamada', 'no handle to reopen the call'))
+  _logEvent('wake-no-handle', 'attempts=' + n)
 }
 
 async function parkSession(ctx) {
   _parkResumeAt = Date.now()
   bus.set({ stage: 'parked', live: false, micLevel: 0, remoteLevel: 0 })
   pushTranscript('sys', tr('en reposo (sin audio ni tokens)', 'parked (no audio, no tokens)'))
+  _logEvent('parked', 'pref=' + (bus.parkPref || 0) + 's idle=' + (bus.parkIdle || 0) + 's')
   const why = await _vadWaitForSpeech(15 * 60 * 1000)
   if (why === 'speech') {
     pushTranscript('sys', tr('te escuché, reabriendo', 'heard you, reopening'))
+    _logEvent('wake-speech', '')
     try { window.__talkResumeLive && window.__talkResumeLive() } catch {}
   } else {
     bus.set({ stage: 'idle' })
