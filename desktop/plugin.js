@@ -340,10 +340,21 @@ function _plainForVoice(t) {
 }
 
 function _delegRespond(dc, itemId, text) {
+  const body = String(text || '').slice(0, 3500)
+  const open = dc && dc.readyState === 'open'
+  if (!bus.live || !open) {
+    // The call is parked or gone: keep the result and wake the call to speak it.
+    _pendingSpeak = body
+    try { window.__talkResumeLive && window.__talkResumeLive() } catch {}
+    return
+  }
   try {
     dc.send(JSON.stringify({ type: 'delegation.context.append', delegation_item_id: itemId,
-      content: [{ type: 'input_text', text: String(text || '').slice(0, 3500) }] }))
-  } catch {}
+      content: [{ type: 'input_text', text: body }] }))
+  } catch {
+    _pendingSpeak = body
+    try { window.__talkResumeLive && window.__talkResumeLive() } catch {}
+  }
 }
 
 function handleDelegation(ctx, msg, dc) {
@@ -614,7 +625,19 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
 
   // canal de eventos: transcripción en vivo + llamadas a tools
   const dc = pc.createDataChannel('oai-events')
-  dc.onopen = () => log('canal de eventos abierto')
+  dc.onopen = () => {
+    log('canal de eventos abierto')
+    if (_pendingSpeak) {
+      const phrase = _pendingSpeak
+      _pendingSpeak = ''
+      setTimeout(() => {
+        try {
+          dc.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'system', content: [{ type: 'input_text', text: tr('Retomá la llamada y decile al usuario este resultado, breve y natural: ', 'Resume the call and tell the user this result, briefly and naturally: ') + phrase }] } }))
+          dc.send(JSON.stringify({ type: 'response.create' }))
+        } catch {}
+      }, 500)
+    }
+  }
   dc.onmessage = ev => {
     let msg = null
     try { msg = JSON.parse(ev.data) } catch { return }
@@ -810,7 +833,6 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
     bus.parkPref = pref ? Math.round(pref / 1000) : 0
     if (!pref) return
     if (!bus.live || bus.stage !== 'connected') { bus.parkIdle = 0; return }
-    if (_delegBusy) { lastVoiceAt = Date.now(); bus.parkIdle = 0; return }
     // ambient noise sits well above 0.03 with the mic gain applied; require
     // either an explicit speech event or a clearly loud frame
     const active = bus.spkUser || bus.spkBot || (bus.micLevel || 0) > 0.09 || (bus.remoteLevel || 0) > 0.09
@@ -867,6 +889,7 @@ const idlePrefSec = ctx => {
 let _parkProbe = null
 let _parkResumeAt = 0
 let _parkThreadId = ''
+let _pendingSpeak = ''
 
 function _vadStop() {
   const p = _parkProbe
