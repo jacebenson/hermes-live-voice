@@ -465,7 +465,7 @@ function handleRealtimeEvent(msg, dc, ctx) {
   const t = msg && msg.type
   if (!t) return
   // ── Codex Live-1: protocolo v3/frameless ──
-  if (t === 'session.started' || t === 'session.updated') return
+  if (t === 'session.started' || t === 'session.updated') { try { _flushPendingSpeak(dc, t) } catch {} return }
   if (t === 'input_transcript.added') { const tx = (msg.item || {}).text; if (tx) pushUserDelta(tx); return }
   if (t === 'output_transcript.added') { const tx = (msg.item || {}).text; if (tx) pushTranscript('bot', tx); return }
   if (t === 'turn.done') {
@@ -492,7 +492,7 @@ function handleRealtimeEvent(msg, dc, ctx) {
   // ── Hermes realtime (realtime-2.1) ──
   if (t === 'input_audio_buffer.speech_started') bus.set({ spkUser: true })
   else if (t === 'input_audio_buffer.speech_stopped') bus.set({ spkUser: false })
-  else if (t === 'output_audio_buffer.started') bus.set({ spkBot: true })
+  else if (t === 'output_audio_buffer.started') { bus.set({ spkBot: true }); if (_speakInjected) { _speakInjected = false; _logEvent('speak-audio', 'bot started speaking the held result') } }
   else if (t === 'output_audio_buffer.stopped') bus.set({ spkBot: false })
   else if (t === 'conversation.item.input_audio_transcription.delta') pushUserDelta(msg.delta || '')
   else if (t === 'conversation.item.input_audio_transcription.completed') finalizeUser(msg.transcript || '')
@@ -570,6 +570,7 @@ async function mintSession(ctx, profile, voice, allowChat) {
 
 async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
   _evtCtx = ctx
+  try { _vadStop() } catch {}   // a new call makes any parked probe obsolete
   _logEvent('session-start', (engine || 'codex') + ' ' + (voice || ''))
   const eng = engine || 'codex'
   clearTranscript()
@@ -631,19 +632,7 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
 
   // canal de eventos: transcripción en vivo + llamadas a tools
   const dc = pc.createDataChannel('oai-events')
-  dc.onopen = () => {
-    log('canal de eventos abierto')
-    if (_pendingSpeak) {
-      const phrase = _pendingSpeak
-      _pendingSpeak = ''
-      setTimeout(() => {
-        try {
-          dc.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'system', content: [{ type: 'input_text', text: tr('Retomá la llamada y decile al usuario este resultado, breve y natural: ', 'Resume the call and tell the user this result, briefly and naturally: ') + phrase }] } }))
-          dc.send(JSON.stringify({ type: 'response.create' }))
-        } catch {}
-      }, 500)
-    }
-  }
+  dc.onopen = () => log('canal de eventos abierto')
   dc.onmessage = ev => {
     let msg = null
     try { msg = JSON.parse(ev.data) } catch { return }
@@ -896,6 +885,25 @@ let _parkProbe = null
 let _parkResumeAt = 0
 let _parkThreadId = ''
 let _pendingSpeak = ''
+let _speakInjected = false
+
+// A fresh codex session ignores items sent before its own session.started /
+// session.updated, so the held result is injected on that event, not on open.
+function _flushPendingSpeak(dc, why) {
+  if (!_pendingSpeak) return
+  const phrase = _pendingSpeak
+  _pendingSpeak = ''
+  setTimeout(() => {
+    try {
+      dc.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'system', content: [{ type: 'input_text', text: tr('Retomá la llamada y decile al usuario este resultado, breve y natural: ', 'Resume the call and tell the user this result, briefly and naturally: ') + phrase }] } }))
+      dc.send(JSON.stringify({ type: 'response.create' }))
+      _speakInjected = true
+      _logEvent('speak-inject', 'via=' + why + ' len=' + phrase.length)
+    } catch (e) {
+      _logEvent('speak-inject-fail', String((e && e.message) || e).slice(0, 120))
+    }
+  }, 300)
+}
 let _evtCtx = null
 
 // Lifecycle events go to the plugin backend so a parked/resumed call can be
