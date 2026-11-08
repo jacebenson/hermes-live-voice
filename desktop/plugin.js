@@ -1108,6 +1108,7 @@ function ConfigForm({ ctx, dense = false }) {
   const [engine, setEngine] = useState(() => ctx.storage.get(KEY_ENGINE) || 'codex')
   const [micTest, setMicTest] = useState({ on: false, err: '' })
   const [pvVoice, setPvVoice] = useState({ state: 'idle', voice: '' })
+  const [adv, setAdv] = useState(false)
   const micBarRef = useRef(null)
   const micTestRef = useRef(null)
   const focusedProf = useValue(sdk.host.state.focusedSessionProfile)
@@ -1166,6 +1167,8 @@ function ConfigForm({ ctx, dense = false }) {
 
   const field = { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: dense ? 6 : 8 }
   const label = { fontSize: 10.5, fontWeight: 600, color: 'var(--ui-text-tertiary, #71717a)', textTransform: 'uppercase', letterSpacing: '0.05em' }
+  const row = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }
+  const rowLabel = { ...label, width: 76, flexShrink: 0, marginBottom: 0 }
   const trigStyle = { width: '100%', minWidth: 0, overflow: 'hidden' }
   const valStyle = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block', flex: '1 1 auto', minWidth: 0 }
   const opt = text => jsx('span', { title: text, style: { display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 232 }, children: text })
@@ -1215,16 +1218,42 @@ function ConfigForm({ ctx, dense = false }) {
     }
   }
 
-  return jsxs('div', { style: { display: 'flex', flexDirection: 'column', width: '100%' }, children: [
+  return jsxs('div', { style: { display: 'flex', flexDirection: 'column', width: '100%', maxHeight: 'min(70vh, 520px)', overflowY: 'auto', overscrollBehavior: 'contain' }, children: [
     jsxs('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }, children: [
       jsx('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--foreground, #18181b)' }, children: 'Live Voice' }),
       info && jsx('div', {
         style: { fontSize: 10.5, fontWeight: 600, color: info.error ? '#dc2626' : '#3b82f6' },
-        children: info.error ? tr('sin host', 'no host') : tr('conectado', 'connected')
+        children: info.error ? tr('sin host', 'host offline') : (engine === 'codex' ? 'Codex' : 'Hermes')
       })
     ] }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: 'Bot' }),
+    jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Voz', 'Voice') }),
+      jsxs(Select, { value: voiceSetFor(engine).indexOf(voice) >= 0 ? voice : voiceDefaultFor(engine), onValueChange: setVoice, children: [
+        jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
+        jsx(SelectContent, { children: voiceGroupsFor(engine).map(group => jsx('div', { role: 'group', 'aria-label': group.label, children: [
+          jsx('div', { 'aria-hidden': 'true', style: { padding: '6px 10px 3px', fontSize: 10, fontWeight: 700, color: 'var(--ui-text-tertiary)' }, children: group.label }, 'group-label-' + group.label),
+          ...group.voices.map(({ id, label }) => jsx(SelectItem, { value: id, children: label }, id))
+        ] }, 'group-' + group.label)) })
+      ] })
+    ] }),
+    jsxs('div', { style: row, children: [
+      jsx('div', { style: { ...rowLabel, lineHeight: 1.25 }, children: tr('Tareas', 'Tasks') }),
+      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }, children: [
+        jsx(Switch, { checked: chatWork, onCheckedChange: v => setChatWork(!!v) }),
+        jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)' }, children: chatWork ? tr('corren en el chat', 'runs in this chat') : tr('solo responde', 'answers only') })
+      ] })
+    ] }),
+    jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', lineHeight: 1.3, marginTop: -2, marginBottom: 8 }, children: chatWork
+      ? tr('La voz puede ejecutar tareas acá, con las tools y el modelo de este chat.', 'Voice can run tasks here, with this chat\'s tools and model.')
+      : tr('La voz solo conversa: no ejecuta nada.', 'Voice only talks: it runs nothing.') }),
+    jsx('button', {
+      type: 'button',
+      onClick: () => setAdv(v => !v),
+      style: { position: 'sticky', bottom: 0, zIndex: 1, alignSelf: 'stretch', margin: '0 0 4px', padding: '8px 0 6px', border: 0, borderTop: '1px solid rgba(127,127,127,0.28)', background: 'transparent', cursor: 'pointer', textAlign: 'left', fontSize: 11.5, fontWeight: 600, color: 'inherit', opacity: 0.85 },
+      children: (adv ? '▾ ' : '▸ ') + (adv ? tr('Menos ajustes', 'Fewer settings') : tr('Más ajustes', 'More settings'))
+    }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: 'Bot' }),
       jsxs(Select, { value: profile === '' ? '__auto' : profile, onValueChange: v => setProfile(v === '__auto' ? '' : v), children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
@@ -1234,87 +1263,51 @@ function ConfigForm({ ctx, dense = false }) {
         ] })
       ] })
     ] }),
-    jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', marginTop: -4, marginBottom: 8 }, children: profile === ''
-      ? (autoName
-        ? tr('sigue la ventana → ', 'follows window → ') + autoName + ' (Bot)'
-        : tr('Automático: usa el bot de la ventana activa (si no, el bot principal).', 'Auto: uses the current window bot (otherwise the main bot).'))
-      : tr('Fijo: ', 'Fixed: ') + (profile === '__host' ? tr('Bot principal (host)', 'Main bot (host)') : profile + ' (Bot)') }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: tr('Motor de voz', 'Voice engine') }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Motor', 'Engine') }),
       jsxs(Select, { value: engine, onValueChange: setEngine, children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
-          jsx(SelectItem, { value: 'codex', children: opt('Codex Live-1 (gpt-live-1)') }),
-          jsx(SelectItem, { value: 'hermes', children: opt('Hermes (gpt-realtime-2.1)') })
+          jsx(SelectItem, { value: 'codex', children: opt(tr('Codex (suscripción)', 'Codex (subscription)')) }),
+          jsx(SelectItem, { value: 'hermes', children: opt(tr('Hermes (realtime)', 'Hermes (realtime)')) })
         ] })
-      ] }),
-      jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', marginTop: -2, marginBottom: 2 }, children: engine === 'codex'
-        ? tr('Con tu suscripción de Codex — recomendado.', 'On your Codex subscription — recommended.')
-        : tr('realtime-2.1 (motor anterior).', 'realtime-2.1 (previous engine).') })
-    ] }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: tr('Voz', 'Voice') }),
-      jsxs(Select, { value: voiceSetFor(engine).indexOf(voice) >= 0 ? voice : voiceDefaultFor(engine), onValueChange: setVoice, children: [
-        jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
-        jsx(SelectContent, { children: voiceGroupsFor(engine).map(group => jsx('div', { role: 'group', 'aria-label': group.label, children: [
-          jsx('div', { 'aria-hidden': 'true', style: { padding: '6px 10px 3px', fontSize: 10, fontWeight: 700, color: 'var(--ui-text-tertiary)' }, children: group.label }, 'group-label-' + group.label),
-          ...group.voices.map(({ id, label }) => jsx(SelectItem, { value: id, children: label }, id))
-        ] }, 'group-' + group.label)) })
-      ] }),
-      engine === 'codex' && jsx('div', { style: { fontSize: 11, color: 'var(--ui-text-tertiary)', marginTop: 4 }, children: voiceLanguageHint() }),
-      jsxs('div', { style: { display: 'none', alignItems: 'center', gap: 8, marginTop: 6 }, children: [   // preview desactivado por ahora
-        jsx(Button, {
-          variant: 'secondary', size: 'sm', onClick: runPreview, style: { flexShrink: 0 },
-          children: [
-            pvVoice.state === 'load' ? jsx('span', { style: { position: 'relative', width: 11, height: 11, display: 'inline-block', marginRight: 6, verticalAlign: '-1px' }, children: jsx(SpinnerRing, { inset: 0 }) }) : null,
-            pvVoice.state === 'load' ? tr('Generando muestra…', 'Generating…') : (pvVoice.state === 'play' ? tr('Reproduciendo…', 'Playing…') : tr('▶ Probar voz', '▶ Test voice'))
-          ]
-        }),
-        jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)', lineHeight: 1.3 }, children: pvVoice.state === 'load' ? tr('La voz está grabando su muestra…', 'The voice is recording its sample…') : tr('Escuchala antes de elegir (queda en caché).', 'Listen before choosing (cached).') })
       ] })
     ] }),
-    jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 10 }, children: [
-      jsx(Switch, { checked: chatWork, onCheckedChange: v => setChatWork(!!v) }),
-      jsxs('div', { style: { fontSize: 11.5, lineHeight: 1.3 }, children: [
-        tr('Trabajar en el chat', 'Work in the chat'),
-        jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)' }, children: tr('Las tareas se ejecutan en el chat abierto, con sus tools y su modelo (tu config de Hermes). La voz no ejecuta nada por su cuenta.', 'Tasks run in the open chat with its tools and model (your Hermes config). The voice never runs anything on its own.') }),
-      ] })
-    ] }),
-    jsx('div', { style: { ...label, marginTop: 6, marginBottom: 6, borderTop: '1px solid var(--ui-stroke-secondary, rgba(127,127,127,0.25))', paddingTop: 8 }, children: tr('Audio', 'Audio') }),
-    jsxs('div', { style: field, children: [
-      jsx('div', { style: label, children: tr('Micrófono', 'Microphone') }),
+    adv && engine === 'codex' && jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary)', marginTop: -4, marginBottom: 6 }, children: voiceLanguageHint() }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Micrófono', 'Mic') }),
       jsxs(Select, { value: micId || SENTINEL_DEFAULT, onValueChange: pick(micId, setMicId), children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
           jsx(SelectItem, { value: SENTINEL_DEFAULT, children: tr('Predeterminado del sistema', 'System default') }),
-          ...devs.mics.map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || (tr('Micrófono ', 'Microphone ') + (i + 1))) }, 'mic-' + i))
+          ...devs.mics.filter(d => !/^(default|predeterminado|comunicaciones|communications)\b/i.test(String(d.label || '').trim())).map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || (tr('Micrófono ', 'Microphone ') + (i + 1))) }, 'mic-' + i))
         ] })
       ] })
     ] }),
-    jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: -4, marginBottom: 10 }, children: [
+    adv && jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }, children: [
       jsx(Button, {
         variant: micTest.on ? 'destructive' : 'secondary', size: 'sm',
         onClick: toggleMicTest,
         style: { flexShrink: 0 },
-        children: micTest.on ? tr('Detener', 'Stop') : tr('Probar', 'Test')
+        children: micTest.on ? tr('Detener', 'Stop') : tr('Probar mic', 'Test mic')
       }),
-      jsx('div', { style: { flex: 1, height: 7, borderRadius: 4, background: 'rgba(127,127,127,0.22)', overflow: 'hidden' }, children:
+      jsx('div', { style: { flex: 1, height: 6, borderRadius: 4, background: 'rgba(127,127,127,0.22)', overflow: 'hidden' }, children:
         jsx('div', { ref: micBarRef, style: { height: '100%', width: '0%', background: micTest.err ? '#dc2626' : '#22c55e' } })
       })
     ] }),
-    micTest.on && !micTest.err && jsx('div', { style: { fontSize: 10, color: '#16a34a', marginTop: -6, marginBottom: 8 }, children: tr('Habla y mira la barra: si no se mueve, este micrófono no capta.', 'Speak and watch the bar: if it stays flat, this mic is not capturing.') }),
-    micTest.err && jsx('div', { style: { fontSize: 10.5, color: '#dc2626', marginTop: -6, marginBottom: 8, lineHeight: 1.4 }, children: micTest.err }),
-    jsxs('div', { style: { ...field, marginBottom: 4 }, children: [
-      jsx('div', { style: label, children: tr('Salida', 'Output') }),
+    micTest.on && !micTest.err && jsx('div', { style: { fontSize: 10, color: '#16a34a', marginTop: -2, marginBottom: 6 }, children: tr('Hablá: si la barra no se mueve, este mic no capta.', 'Speak: a flat bar means this mic is not capturing.') }),
+    micTest.err && jsx('div', { style: { fontSize: 10.5, color: '#dc2626', marginTop: -2, marginBottom: 6, lineHeight: 1.4 }, children: micTest.err }),
+    adv && jsxs('div', { style: row, children: [
+      jsx('div', { style: rowLabel, children: tr('Salida', 'Output') }),
       jsxs(Select, { value: outId || SENTINEL_DEFAULT, onValueChange: pick(outId, setOutId), children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
           jsx(SelectItem, { value: SENTINEL_DEFAULT, children: tr('Predeterminado del sistema', 'System default') }),
-          ...devs.outs.map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || ('Salida ' + (i + 1))) }, 'out-' + i))
+          ...devs.outs.filter(d => !/^(default|predeterminado|comunicaciones|communications)\b/i.test(String(d.label || '').trim())).map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || ('Salida ' + (i + 1))) }, 'out-' + i))
         ] })
       ] })
     ] }),
-    devs.mics.length === 0 && jsx('div', { style: { fontSize: 10.5, color: 'var(--ui-text-tertiary, #a1a1aa)', lineHeight: 1.4 }, children: tr('Los dispositivos aparecen tras conceder el micrófono la primera vez.', 'Devices appear after granting the microphone the first time.') }),
+    adv && devs.mics.length === 0 && jsx('div', { style: { fontSize: 10.5, color: 'var(--ui-text-tertiary, #a1a1aa)', lineHeight: 1.4, marginBottom: 6 }, children: tr('Los dispositivos aparecen tras conceder el micrófono la primera vez.', 'Devices appear after granting the microphone the first time.') }),
     jsx('div', { style: { borderTop: '1px solid var(--ui-stroke-secondary, rgba(127,127,127,0.25))', marginTop: 6, paddingTop: 8 }, children: jsx(CodexSection, { ctx }) })
   ] })
 }
