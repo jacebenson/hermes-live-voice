@@ -791,6 +791,15 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
     }
   }
   const meterLoop = makeLoop(tick, 24)
+  // A park stops only the realtime session; the Codex thread survives it, so a
+  // reopen reattaches to the same conversation. Record whether it really did.
+  if (eng === 'codex' && codexSession && codexSession.threadId) {
+    const tid = String(codexSession.threadId)
+    if (_parkThreadId && tid !== _parkThreadId) {
+      DIAG.push({ t: new Date().toISOString(), stage: 'thread-changed', live: true, err: '', vis: document.visibilityState, awake: !!(_wakeSentinel && !_wakeSentinel.released), pc: 'n/a', net: _parkThreadId + ' -> ' + tid })
+    }
+    _parkThreadId = tid
+  }
 
   // Auto-park: close this session after `idle.v1` seconds with no voice in
   // either direction, then reopen on speech. Never while a task is running.
@@ -852,6 +861,7 @@ const idlePrefSec = ctx => {
 
 let _parkProbe = null
 let _parkResumeAt = 0
+let _parkThreadId = ''
 
 function _vadStop() {
   const p = _parkProbe
